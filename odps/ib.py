@@ -1,7 +1,6 @@
 # odps/ib.py
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -26,6 +25,8 @@ _MONTHS = {
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
 }
 
+# ----------------- date helpers -----------------
+
 def _third_friday(year: int, month: int) -> datetime.date:
     from calendar import monthcalendar, FRIDAY
     cal = monthcalendar(year, month)
@@ -36,10 +37,11 @@ def _third_friday(year: int, month: int) -> datetime.date:
 
 def _month_code_to_date(month_code: str) -> datetime.date:
     """
-    Accepts 'YYYYMM', 'YYYYMMDD', or 'MONYY' (e.g., NOV25). Defaults to 3rd Friday when day absent.
+    Accepts 'YYYYMM', 'YYYYMMDD', or 'MONYY' (e.g., NOV25).
+    Defaults to 3rd Friday when day is absent.
     """
     s = str(month_code).strip().upper()
-    # YYYYMM / YYYYMMDD
+    today = datetime.now(timezone.utc).date()
     if s.isdigit():
         if len(s) == 6:
             y, m = int(s[:4]), int(s[4:6])
@@ -47,14 +49,12 @@ def _month_code_to_date(month_code: str) -> datetime.date:
         if len(s) == 8:
             y, m, d = int(s[:4]), int(s[4:6]), int(s[6:8])
             return datetime(y, m, d, tzinfo=timezone.utc).date()
-    # MONYY
-    if len(s) == 5 and s[:3] in _MONTHS:
+    if len(s) == 5 and s[:3] in _MONTHS:  # MONYY
         m = _MONTHS[s[:3]]
         yy = int(s[3:])
         y = 2000 + yy if yy < 80 else 1900 + yy
         return _third_friday(y, m)
-    # fallback: 3 months ahead
-    today = datetime.now(timezone.utc).date()
+    # fallback ~3 months ahead
     m = (today.month + 2) % 12 + 1
     y = today.year + (1 if today.month > 10 else 0)
     return _third_friday(y, m)
@@ -90,9 +90,7 @@ def _pick_best_month(months: List[str], target_T_years: float) -> Optional[str]:
     return scored[0][0]
 
 def _fmt_month_variants(month_code: str) -> List[str]:
-    """
-    Return both 'MONYY' and 'YYYYMM' variants for robustness with /secdef/info.
-    """
+    """Return both 'MONYY' and 'YYYYMM' variants for robustness with /secdef/info."""
     d = _month_code_to_date(month_code)
     yyyymm = f"{d.year:04d}{d.month:02d}"
     inv = {v: k for k, v in _MONTHS.items()}
@@ -104,6 +102,8 @@ def _safe_float(x) -> Optional[float]:
         return float(x) if x is not None else None
     except Exception:
         return None
+
+# ----------------- IB client -----------------
 
 @dataclass
 class IBClient:
@@ -119,13 +119,11 @@ class IBClient:
     ca_bundle: Optional[str] = None
     verify_ssl: bool = True
 
-    # --------- low-level HTTP ---------
-
     def _client(self) -> httpx.Client:
         if not self.base_url:
             raise RuntimeError("IB base_url not set. Define IB_GATEWAY_URL or pass to IBClient().")
         verify = self.ca_bundle if self.ca_bundle else self.verify_ssl  # bool or path
-        # trust_env=False so proxies don't hijack localhost
+        # trust_env=False so OS/http_proxy env vars don't interfere with localhost
         return httpx.Client(base_url=self.base_url, timeout=10.0, verify=verify, trust_env=False)
 
     def _get(self, path: str, params: Dict | None = None):
@@ -142,12 +140,12 @@ class IBClient:
                 f"Ensure it is running/authenticated and SSL settings are correct. Underlying: {e}"
             ) from e
 
-    # --------- diagnostics ---------
+    # ------------- diagnostics -------------
 
     def auth_status(self) -> Dict:
         return self._get("/iserver/auth/status", params={})
 
-    # --------- snapshots ---------
+    # ------------- low-level market data -------------
 
     def _snapshot(self, conids: List[int | str], fields: List[str]) -> List[Dict]:
         params = {"conids": ",".join(str(c) for c in conids), "fields": ",".join(fields)}
@@ -155,47 +153,77 @@ class IBClient:
         return js if isinstance(js, list) else [js]
 
     def _spot_from_snapshot(self, conid: int | str) -> Optional[float]:
-        # ask for last + bid/ask; use mid if last is missing
+        """Request last + bid/ask; fall back to mid if last is missing."""
         fields = [_FIELD_MAP["last"], _FIELD_MAP["bid"], _FIELD_MAP["ask"]]
         rows = self._snapshot([conid], fields)
         if not rows:
             return None
         row = rows[0]
         last = _safe_float(row.get(_FIELD_MAP["last"]))
-        bid = _safe_float(row.get(_FIELD_MAP["bid"]))
-        ask = _safe_float(row.get(_FIELD_MAP["ask"]))
+        bid  = _safe_float(row.get(_FIELD_MAP["bid"]))
+        ask  = _safe_float(row.get(_FIELD_MAP["ask"]))
         if last is not None:
             return last
         if bid is not None and ask is not None:
             return 0.5 * (bid + ask)
         return None
 
-    # --------- underlying ---------
+    # ------------- underlying selection -------------
 
     def get_contract(self, symbol: str) -> Dict:
         """
-        Resolve underlying conid and return {'conid': int, 'price': float|None}
-        where price is last or bid/ask mid.
+        Resolve underlying conid robustly and return {'conid': int, 'price': float|None}.
+        Strategy:
+          1) Search candidates with /iserver/secdef/search.
+          2) Prefer exact symbol, US listings (NYSE/NASDAQ), SMART routes.
+          3) Probe top candidates with a snapshot (31/84/86) and pick the first with a usable spot (last or mid).
+          4) If none yield quotes, return the best-scored candidate with price=None.
         """
         data = self._get("/iserver/secdef/search", {"symbol": symbol})
         if not data or not isinstance(data, list):
             raise RuntimeError(f"No contracts found for symbol '{symbol}'.")
-        candidates = [x for x in data if str(x.get("secType", "")).upper() == "STK"] or data
-        sym_u = symbol.upper()
-        exact = [x for x in candidates if str(x.get("symbol", "")).upper() == sym_u]
-        chosen = exact[0] if exact else candidates[0]
-        conid = chosen.get("conid") or chosen.get("conId") or chosen.get("contractId")
-        if not conid:
-            raise RuntimeError(f"Could not resolve conid for symbol '{symbol}'. Response: {chosen}")
-        spot = self._spot_from_snapshot(conid)
-        return {"conid": int(conid), "price": float(spot) if spot is not None else None}
 
-    # --------- chain discovery ---------
+        symu = symbol.upper()
+
+        def score(x):
+            sx = (str(x.get("symbol") or "")).upper()
+            listing = (str(x.get("listingExchange") or x.get("exchange") or "")).upper()
+            desc = (str(x.get("description") or "")).upper()
+            exch = (str(x.get("exchange") or "")).upper()
+            is_exact = 0 if sx == symu else 1
+            is_us   = 0 if (listing in ("NYSE", "NASDAQ") or "NYSE" in desc or "NASDAQ" in desc) else 1
+            is_smart= 0 if exch == "SMART" else 1
+            return (is_exact, is_us, is_smart)
+
+        candidates = sorted(data, key=score)
+
+        fields = [_FIELD_MAP["last"], _FIELD_MAP["bid"], _FIELD_MAP["ask"]]
+        for x in candidates[:5]:
+            conid = x.get("conid") or x.get("conId") or x.get("contractId")
+            if not conid:
+                continue
+            rows = self._snapshot([conid], fields)
+            if not rows:
+                continue
+            row = rows[0]
+            last = _safe_float(row.get(_FIELD_MAP["last"]))
+            bid  = _safe_float(row.get(_FIELD_MAP["bid"]))
+            ask  = _safe_float(row.get(_FIELD_MAP["ask"]))
+            spot = last if last is not None else (0.5 * (bid + ask) if (bid is not None and ask is not None) else None)
+            if spot is not None:
+                return {"conid": int(conid), "price": float(spot)}
+
+        # Fallback: usable conid but no quotes (likely missing entitlements)
+        best = candidates[0]
+        conid = best.get("conid") or best.get("conId") or best.get("contractId")
+        if not conid:
+            raise RuntimeError(f"Could not resolve conid for symbol '{symbol}'. Response: {best}")
+        return {"conid": int(conid), "price": None}
+
+    # ------------- chain discovery -------------
 
     def _list_option_months(self, underlying_conid: int | str, exchange: str = "SMART") -> List[str]:
-        """
-        Query available months for the underlying's option chain via /iserver/secdef/strikes.
-        """
+        """Get available expiries ('months') for the option chain via /iserver/secdef/strikes."""
         params = {"conid": str(underlying_conid), "secType": "OPT", "exchange": exchange}
         js = self._get("/iserver/secdef/strikes", params)
         months: List[str] = []
@@ -205,7 +233,6 @@ class IBClient:
             for item in js:
                 if isinstance(item, dict) and "months" in item:
                     months.extend(_to_month_codes(item["months"]))
-        # uniq preserve order
         out, seen = [], set()
         for m in months:
             if m not in seen:
@@ -262,7 +289,6 @@ class IBClient:
                 js = None
             if not js:
                 continue
-            # dict or list, conid may be top-level or under 'contracts'
             if isinstance(js, dict):
                 cid = js.get("conid") or js.get("conId") or js.get("contractId")
                 if cid:
@@ -285,7 +311,7 @@ class IBClient:
                                     return int(cid2)
         return None
 
-    # --------- public: option snapshot & surface ---------
+    # ------------- public: option snapshot & surface -------------
 
     def get_option_snapshot(self, underlying_conid: int | str, strike: float, option_type: str, T_years: float) -> Dict:
         """
@@ -295,7 +321,7 @@ class IBClient:
         months = self._list_option_months(underlying_conid)
         month_code = _pick_best_month(months, T_years) if months else None
         if not month_code:
-            return {k: None for k in list(_FIELD_MAP.keys())}  # graceful fallback
+            return {k: None for k in list(_FIELD_MAP.keys())}
 
         strikes = self._list_strikes_for_month(underlying_conid, month_code)
         K = float(strike)
@@ -308,9 +334,7 @@ class IBClient:
 
         fields = list(_FIELD_MAP.values())
         row = self._snapshot([conid_opt], fields)[0]
-        out = {}
-        for k, f in _FIELD_MAP.items():
-            out[k] = _safe_float(row.get(f))
+        out = {k: _safe_float(row.get(f)) for k, f in _FIELD_MAP.items()}
         out["conid"] = conid_opt
         out["strike_resolved"] = K
         out["month_code"] = month_code
@@ -341,7 +365,6 @@ class IBClient:
         T_years = _years_between(_month_code_to_date(month_code))
         fields = list(_FIELD_MAP.values())
 
-        # try calls first; if IV missing, try puts
         for K in band:
             iv = None
             conid_c = self._resolve_option_conid(underlying_conid, month_code, K, "C")
@@ -363,7 +386,7 @@ class IBClient:
 
         return {"spot": float(spot or 100.0), "points": points}
 
-    # --------- public: strike by delta ---------
+    # ------------- public: strike by delta -------------
 
     def find_strike_by_delta(
         self,
@@ -421,7 +444,8 @@ def find_strike_by_delta(
     exchange: str = "SMART",
 ) -> float:
     """
-    Back-compat for code that imported `find_strike_by_delta` as a function.
+    Back-compat wrapper so callers can still import
+    `from odps.ib import find_strike_by_delta`.
     """
     return ib.find_strike_by_delta(
         underlying_conid=underlying_conid,
