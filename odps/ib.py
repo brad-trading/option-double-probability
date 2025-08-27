@@ -64,38 +64,33 @@ def _years_between(d: datetime.date) -> float:
     days = (d - today).days
     return max(days / 365.25, 1e-6)
 
-def _to_month_codes(obj) -> List[str]:
-    if isinstance(obj, list):
-        return [str(x) for x in obj]
-    if isinstance(obj, dict) and "months" in obj:
-        return [str(x) for x in obj["months"]]
-    return []
-
-def _pick_best_month(months: List[str], target_T_years: float) -> Optional[str]:
-    if not months:
-        return None
-    target_days = target_T_years * 365.25
-    scored: List[Tuple[str, float]] = []
+def _derive_month_code_from_T(target_T_years: float) -> str:
+    """
+    Derive a YYYYMM code by adding T to today (UTC), snapping forward to the 3rd Friday month.
+    """
     today = datetime.now(timezone.utc).date()
-    for m in months:
-        try:
-            d = _month_code_to_date(m)
-            diff = abs((d - today).days - target_days)
-            scored.append((m, diff))
-        except Exception:
-            pass
-    if not scored:
-        return None
-    scored.sort(key=lambda x: x[1])
-    return scored[0][0]
+    import math
+    days = int(round(target_T_years * 365.25))
+    future = today.fromordinal(today.toordinal() + max(days, 1))
+    y, m = future.year, future.month
+    d = _third_friday(y, m)
+    if d < future:
+        if m == 12:
+            y, m = y + 1, 1
+        else:
+            m += 1
+        d = _third_friday(y, m)
+    return f"{y:04d}{m:02d}"
 
-def _fmt_month_variants(month_code: str) -> List[str]:
-    """Return both 'MONYY' and 'YYYYMM' variants for robustness with /secdef/info."""
-    d = _month_code_to_date(month_code)
-    yyyymm = f"{d.year:04d}{d.month:02d}"
+def _month_variants_from_T(target_T_years: float) -> List[str]:
+    """
+    Return both YYYYMM and MONYY codes derived from T.
+    """
+    yyyymm = _derive_month_code_from_T(target_T_years)
+    y, m = int(yyyymm[:4]), int(yyyymm[4:6])
     inv = {v: k for k, v in _MONTHS.items()}
-    monyy = f"{inv[d.month]}{str(d.year)[2:]}"
-    return [monyy, yyyymm]
+    monyy = f"{inv[m]}{str(y)[2:]}"
+    return [yyyymm, monyy]
 
 def _safe_float(x) -> Optional[float]:
     try:
@@ -123,6 +118,7 @@ class IBClient:
         if not self.base_url:
             raise RuntimeError("IB base_url not set. Define IB_GATEWAY_URL or pass to IBClient().")
         verify = self.ca_bundle if self.ca_bundle else self.verify_ssl  # bool or path
+        # trust_env=False so proxies don't interfere with localhost
         return httpx.Client(base_url=self.base_url, timeout=10.0, verify=verify, trust_env=False)
 
     def _get(self, path: str, params: Dict | None = None):
@@ -144,17 +140,11 @@ class IBClient:
             with self._client() as c:
                 r = c.post(path, json=json or {})
                 r.raise_for_status()
-                if r.text and r.headers.get("content-type","").startswith("application/json"):
+                if r.text and r.headers.get("content-type", "").startswith("application/json"):
                     return r.json()
                 return {}
         except httpx.HTTPStatusError as e:
             raise RuntimeError(f"IB POST {path} returned {e.response.status_code}: {e.response.text}") from e
-        except Exception as e:
-            raise RuntimeError(
-                f"IB Gateway unreachable at {self.base_url}. "
-                f"Ensure it is running/authenticated and SSL settings are correct. Underlying: {e}"
-            ) from e
-
     # ------------- diagnostics -------------
 
     def auth_status(self) -> Dict:
@@ -171,14 +161,11 @@ class IBClient:
             js = self._get("/iserver/marketdata/snapshot", params)
             return js if isinstance(js, list) else [js]
         except RuntimeError as e:
-            # Auto-enable delayed market data once, then retry
             if " 403" in str(e) or "Forbidden" in str(e):
-                try:
-                    self._post("/iserver/marketdata/delayed/enable", {})
-                    js = self._get("/iserver/marketdata/snapshot", params)
-                    return js if isinstance(js, list) else [js]
-                except Exception:
-                    raise
+                # attempt to enable delayed data then retry once
+                self._post("/iserver/marketdata/delayed/enable", {})
+                js = self._get("/iserver/marketdata/snapshot", params)
+                return js if isinstance(js, list) else [js]
             raise
 
     def _spot_from_snapshot(self, conid: int | str) -> Optional[float]:
@@ -204,7 +191,7 @@ class IBClient:
         Resolve underlying conid robustly and return {'conid': int, 'price': float|None}.
         Strategy:
           1) Search candidates with /iserver/secdef/search.
-          2) Drop obvious bads (conid=2147483647, missing secType).
+          2) Drop obvious bads (conid=2147483647, missing conid).
           3) Prefer exact symbol, US listings (NYSE/NASDAQ), SMART routes.
           4) Probe top candidates with snapshot (31/84/86); pick first with usable spot (last or mid).
           5) If none yield quotes, return best-scored candidate with price=None.
@@ -215,7 +202,6 @@ class IBClient:
 
         symu = symbol.upper()
 
-        # filter out sentinel/bad entries
         def good(x):
             conid = (x.get("conid") or x.get("conId") or x.get("contractId"))
             if not conid:
@@ -225,8 +211,7 @@ class IBClient:
                     return False
             except Exception:
                 pass
-            sec = str(x.get("secType") or "").upper()
-            return (sec in ("", "STK"))  # IB often omits secType in this endpoint
+            return True
 
         filtered = [x for x in data if good(x)] or data
 
@@ -265,27 +250,13 @@ class IBClient:
             raise RuntimeError(f"Could not resolve conid for symbol '{symbol}'. Response: {best}")
         return {"conid": int(conid), "price": None}
 
-    # ------------- chain discovery -------------
+    # ------------- chain discovery (month derived from T) -------------
 
-    def _list_option_months(self, underlying_conid: int | str, exchange: str = "SMART") -> List[str]:
-        """Get available expiries ('months') for the option chain via /iserver/secdef/strikes."""
-        params = {"conid": str(underlying_conid), "secType": "OPT", "exchange": exchange}
-        js = self._get("/iserver/secdef/strikes", params)
-        months: List[str] = []
-        if isinstance(js, dict) and "months" in js:
-            months = _to_month_codes(js["months"])
-        elif isinstance(js, list):
-            for item in js:
-                if isinstance(item, dict) and "months" in item:
-                    months.extend(_to_month_codes(item["months"]))
-        out, seen = [], set()
-        for m in months:
-            if m not in seen:
-                out.append(m); seen.add(m)
-        return out
-
-    def _list_strikes_for_month(self, underlying_conid: int | str, month_code: str, exchange: str = "SMART") -> List[float]:
-        params = {"conid": str(underlying_conid), "secType": "OPT", "exchange": exchange, "month": month_code}
+    def _list_strikes_for_month(self, underlying_conid: int | str, yyyymm: str, exchange: str = "SMART") -> List[float]:
+        """
+        Get valid strikes for a specific month (YYYYMM) via /iserver/secdef/strikes.
+        """
+        params = {"conid": str(underlying_conid), "secType": "OPT", "exchange": exchange, "month": yyyymm}
         js = self._get("/iserver/secdef/strikes", params)
         strikes: List[float] = []
         raw: List = []
@@ -319,7 +290,7 @@ class IBClient:
         Tries both MONYY and YYYYMM encodings.
         """
         side = right.upper()[0]  # 'C' or 'P'
-        for m in _fmt_month_variants(month_code):
+        for m in (month_code,) if len(month_code) == 5 else (month_code,):  # allow direct pass-through
             params = {
                 "conid": str(underlying_conid),
                 "secType": "OPT",
@@ -360,20 +331,45 @@ class IBClient:
 
     def get_option_snapshot(self, underlying_conid: int | str, strike: float, option_type: str, T_years: float) -> Dict:
         """
-        Pick expiry closest to T_years, snap to nearest listed strike, resolve option conid,
-        and return snapshot with last/bid/ask/IV/Greeks.
+        Derive month from T, fetch strikes for that month, resolve the exact option conid,
+        and return snapshot with last/bid/ask/IV/Greeks. Falls back gracefully.
         """
-        months = self._list_option_months(underlying_conid)
-        month_code = _pick_best_month(months, T_years) if months else None
-        if not month_code:
+        # Month candidates from T
+        month_candidates = _month_variants_from_T(T_years)  # [YYYYMM, MONYY]
+        # get strikes using YYYYMM (first candidate) or convert MONYY -> YYYYMM
+        strikes = []
+        month_code_for_strikes = None
+        for mc in month_candidates:
+            try:
+                if len(mc) == 6 and mc.isdigit():
+                    yyyymm = mc
+                else:
+                    d = _month_code_to_date(mc)
+                    yyyymm = f"{d.year:04d}{d.month:02d}"
+                strikes = self._list_strikes_for_month(underlying_conid, yyyymm)
+                month_code_for_strikes = yyyymm
+                if strikes:
+                    break
+            except Exception:
+                continue
+
+        if not strikes:
             return {k: None for k in list(_FIELD_MAP.keys())}
 
-        strikes = self._list_strikes_for_month(underlying_conid, month_code)
-        K = float(strike)
-        if strikes:
-            K = min(strikes, key=lambda x: abs(x - K))
+        # nearest strike
+        K = float(min(strikes, key=lambda x: abs(x - float(strike))))
 
-        conid_opt = self._resolve_option_conid(underlying_conid, month_code, K, option_type)
+        # resolve conid: try MONYY then YYYYMM for info endpoint
+        conid_opt = None
+        chosen_mon = None
+        for mon in month_candidates:
+            conid_opt = self._resolve_option_conid(underlying_conid, mon, K, option_type)
+            if conid_opt:
+                chosen_mon = mon
+                break
+        if not conid_opt and month_code_for_strikes:
+            conid_opt = self._resolve_option_conid(underlying_conid, month_code_for_strikes, K, option_type)
+            chosen_mon = month_code_for_strikes
         if not conid_opt:
             return {k: None for k in list(_FIELD_MAP.keys())}
 
@@ -382,45 +378,54 @@ class IBClient:
         out = {k: _safe_float(row.get(f)) for k, f in _FIELD_MAP.items()}
         out["conid"] = conid_opt
         out["strike_resolved"] = K
-        out["month_code"] = month_code
+        out["month_code"] = chosen_mon
         return out
 
     def build_surface(self, underlying_conid: int | str, spot: float) -> Dict:
         """
-        Live IV surface around ATM for the expiry closest to ~0.25y.
-        Falls back to mock surface if insufficient points or endpoints unavailable.
+        Live IV surface around ATM for an expiry close to 0.25y (derived locally).
+        Falls back to mock if insufficient points.
         """
         target_T = 0.25
-        months = self._list_option_months(underlying_conid)
-        month_code = _pick_best_month(months, target_T) if months else None
-        if not month_code:
-            from .vol_surface import build_mock_surface
-            return build_mock_surface(spot or 100.0)
+        month_candidates = _month_variants_from_T(target_T)
 
-        strikes = self._list_strikes_for_month(underlying_conid, month_code)
+        # strikes for derived month (prefer YYYYMM)
+        strikes = []
+        for mc in month_candidates:
+            try:
+                if len(mc) == 6 and mc.isdigit():
+                    yyyymm = mc
+                else:
+                    d = _month_code_to_date(mc)
+                    yyyymm = f"{d.year:04d}{d.month:02d}"
+                strikes = self._list_strikes_for_month(underlying_conid, yyyymm)
+                if strikes:
+                    break
+            except Exception:
+                continue
+
         if not strikes:
             from .vol_surface import build_mock_surface
             return build_mock_surface(spot or 100.0)
 
         atm = float(spot or 100.0)
         strikes_sorted = sorted(strikes, key=lambda x: abs(x - atm))
-        band = sorted(set(strikes_sorted[:15]))  # small band to avoid 429s
+        band = sorted(set(strikes_sorted[:15]))  # avoid 429s
 
         points = []
-        T_years = _years_between(_month_code_to_date(month_code))
+        T_years = _years_between(_month_code_to_date(month_candidates[0]))
         fields = list(_FIELD_MAP.values())
 
         for K in band:
             iv = None
-            conid_c = self._resolve_option_conid(underlying_conid, month_code, K, "C")
-            if conid_c:
-                row = self._snapshot([conid_c], fields)[0]
-                iv = _safe_float(row.get(_FIELD_MAP["implied_volatility"]))
-            if iv is None:
-                conid_p = self._resolve_option_conid(underlying_conid, month_code, K, "P")
-                if conid_p:
-                    row2 = self._snapshot([conid_p], fields)[0]
-                    iv = _safe_float(row2.get(_FIELD_MAP["implied_volatility"]))
+            # try call then put
+            for side in ("C", "P"):
+                conid = self._resolve_option_conid(underlying_conid, month_candidates[0], K, side)
+                if conid:
+                    row = self._snapshot([conid], fields)[0]
+                    iv = _safe_float(row.get(_FIELD_MAP["implied_volatility"]))
+                    if iv is not None:
+                        break
             if iv is None:
                 continue
             points.append({"K": float(K), "T": float(T_years), "iv": float(iv)})
@@ -443,17 +448,27 @@ class IBClient:
     ) -> float:
         """
         Choose the strike with |Δ| closest to target_abs_delta for expiry ~expiry_years.
-        Samples near-ATM to reduce API load.
+        Uses derived month from expiry_years and samples near-ATM to reduce API load.
         """
-        months = self._list_option_months(underlying_conid, exchange=exchange)
-        if not months:
-            spot = self._spot_from_snapshot(underlying_conid) or 100.0
-            return float(spot)
-
         T_target = expiry_years if (expiry_years and expiry_years > 0) else 0.25
-        month_code = _pick_best_month(months, T_target) or months[0]
+        month_candidates = _month_variants_from_T(T_target)
 
-        strikes = self._list_strikes_for_month(underlying_conid, month_code, exchange=exchange)
+        # get strikes for derived month
+        strikes = []
+        for mc in month_candidates:
+            try:
+                if len(mc) == 6 and mc.isdigit():
+                    yyyymm = mc
+                else:
+                    d = _month_code_to_date(mc)
+                    yyyymm = f"{d.year:04d}{d.month:02d}"
+                strikes = self._list_strikes_for_month(underlying_conid, yyyymm, exchange=exchange)
+                if strikes:
+                    month_for_info = mc  # keep the variant we'll use for info
+                    break
+            except Exception:
+                continue
+
         if not strikes:
             spot = self._spot_from_snapshot(underlying_conid) or 100.0
             return float(spot)
@@ -466,7 +481,7 @@ class IBClient:
         side = option_type.upper()[0]
 
         for K in near:
-            conid = self._resolve_option_conid(underlying_conid, month_code, K, side, exchange=exchange)
+            conid = self._resolve_option_conid(underlying_conid, month_for_info, K, side, exchange=exchange)
             if not conid:
                 continue
             row = self._snapshot([conid], fields)[0]
@@ -499,4 +514,3 @@ def find_strike_by_delta(
         expiry_years=expiry_years,
         exchange=exchange,
     )
-
