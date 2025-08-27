@@ -38,7 +38,7 @@ def main(symbol, expiry, option_type, strike, delta, sims, steps_per_day, seed, 
     T = parse_expiry_to_years(expiry)
 
     # Live IB (optional)
-    ib = IBClient(cfg.ib_url, cfg.ib_ca_bundle) if (live and cfg.ib_url) else None
+    ib = IBClient(cfg.ib_url, cfg.ib_ca_bundle, cfg.ib_verify_ssl) if (live and cfg.ib_url) else None
 
     # Get spot, current option price, and vol surface
     if ib:
