@@ -28,147 +28,178 @@ class MonteCarlo:
         return max(1, int(self._T * 365 * self.steps_per_day))
 
     def doubling_probability(self, S0: float, K: float, T: float, r: float,
-                             option_type: str, current_option_price: float,
-                             vol_fn: Callable[[float,float], float]) -> Dict:
-        """
-        Simulate GBM paths with local vol σ(K,T) for pricing.
-        Doubling target = 2 * current_option_price.
-        Gamma-aware intrastep detection:
-          Solve for α in (0,1): V_t + Δ*(αΔS) + ½Γ*(αΔS)^2 = target
-        """
-        t0 = time.time()
-        self._T = float(T)
-        N = self.N
-        dt = self._T / N
-        target = 2.0 * float(current_option_price)
+                         option_type: str, current_option_price: float,
+                         vol_fn: Callable[[float,float], float]) -> Dict:
+    t0 = time.time()
+    self._T = float(T)
+    N = self.N
+    dt = self._T / N
+    target = 2.0 * float(current_option_price)
 
-        rng = np.random.default_rng(self.seed)
+    rng = np.random.default_rng(self.seed)
+    # batches so we don't blow RAM
+    num_batches = (self.num_paths + self.batch_size - 1) // self.batch_size
+    paths_remaining = self.num_paths
 
-        # aggregation holders
-        all_max = []
-        all_doubled = []
-        all_ttd = []
+    all_max = []
+    all_doubled = []
+    all_ttd = []
 
-        # ceiling division for batches (no dropped remainder)
-        num_batches = (self.num_paths + self.batch_size - 1) // self.batch_size
-        paths_remaining = self.num_paths
+    # Precompute time grid & time-to-maturity
+    time_grid = np.linspace(0.0, self._T, N + 1)
+    Ttm_grid = (self._T - time_grid).clip(min=1e-12)
 
-        for b in range(num_batches):
-            bs = min(self.batch_size, paths_remaining)
-            paths_remaining -= bs
+    # Precompute vols per time only once (σ depends on K, T; not on S)
+    sig_t = np.array([max(0.01, float(vol_fn(K, Ttm))) for Ttm in Ttm_grid], dtype=float)
 
-            # simulate GBM with local vol at spot (for drift we use r)
-            S = np.empty((bs, N+1), dtype=float)
-            S[:,0] = S0
-            Z = rng.standard_normal((bs, N))
-            for t in range(N):
-                # local vol for spot strike at time remaining
-                Ttm = self._T - t*dt
-                vol = max(0.01, float(vol_fn(K, Ttm)))
-                S[:, t+1] = S[:, t] * np.exp((r - 0.5*vol*vol)*dt + vol*np.sqrt(dt)*Z[:, t])
+    for _ in range(num_batches):
+        bs = min(self.batch_size, paths_remaining)
+        paths_remaining -= bs
 
-            # price path → option value path
-            doubled = np.zeros(bs, dtype=bool)
-            ttd = np.full(bs, np.nan)
-            max_vals = np.zeros(bs, dtype=float)
-            time_grid = np.linspace(0.0, self._T, N+1)
+        # ----- simulate GBM for all paths (vectorized) -----
+        S = np.empty((bs, N + 1), dtype=float)
+        S[:, 0] = S0
+        Z = rng.standard_normal((bs, N))
+        # use per-time vol and drift
+        drift = (r - 0.5 * sig_t[:-1] ** 2) * dt        # shape (N,)
+        vol_step = sig_t[:-1] * np.sqrt(dt)             # shape (N,)
+        for t in range(N):
+            S[:, t + 1] = S[:, t] * np.exp(drift[t] + vol_step[t] * Z[:, t])
 
-            for i in range(bs):
-                V = np.empty(N+1, dtype=float)
-                # Precompute vols along path at the option strike (consistent with surface)
-                sig = np.empty(N+1, dtype=float)
-                for t in range(N+1):
-                    Ttm = self._T - time_grid[t]
-                    if Ttm > 0:
-                        sig[t] = float(vol_fn(K, Ttm))
-                        V[t] = bs_price(S[i,t], K, Ttm, r, sig[t], option_type)
-                    else:
-                        sig[t] = sig[max(t-1,0)] if t>0 else float(vol_fn(K, 1e-6))
-                        V[t] = max(S[i,t]-K, 0.0) if option_type=="call" else max(K-S[i,t], 0.0)
+        # ----- price option for every (path, time) (vectorized per time) -----
+        V = np.empty_like(S)
+        # at expiry:
+        if option_type == "call":
+            V[:, -1] = (S[:, -1] - K).clip(min=0.0)
+        else:
+            V[:, -1] = (K - S[:, -1]).clip(min=0.0)
 
-                max_vals[i] = float(np.max(V))
-                # quick check (grid hit)
-                if max_vals[i] >= target:
-                    doubled[i] = True
-                    idx = int(np.argmax(V >= target))
-                    ttd[i] = time_grid[idx]
+        # for t = N-1 .. 0 (but pricing is stateless; order doesn’t matter)
+        from .greeks import bs_price as _bs
+        for t in range(N):
+            Ttm = Ttm_grid[t]
+            sigma = sig_t[t]
+            # vectorized BS via broadcasting over S[:,t]
+            St = S[:, t]
+            if Ttm <= 0:
+                V[:, t] = V[:, -1]  # fallback
+            else:
+                # inline vectorized BS (avoids Python loop)
+                sqrtT = np.sqrt(Ttm)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    d1 = (np.log(St / K) + (r + 0.5 * sigma**2) * Ttm) / (sigma * sqrtT)
+                d2 = d1 - sigma * sqrtT
+                from scipy.stats import norm
+                if option_type == "call":
+                    V[:, t] = St * norm.cdf(d1) - K * np.exp(-r * Ttm) * norm.cdf(d2)
                 else:
-                    # Γ-aware intrastep crossing check
-                    for t in range(N):
-                        if V[t] >= target:
-                            doubled[i] = True
-                            ttd[i] = time_grid[t]
-                            break
-                        if V[t] < target and V[t+1] < target:
-                            # only check if move is "toward" target (optional short-circuit)
-                            pass
-                        # Try to locate an intrastep α
-                        Ttm = self._T - time_grid[t]
-                        if Ttm <= 0: continue
-                        dS = S[i,t+1] - S[i,t]
-                        if dS == 0.0: continue
-                        Delta = bs_delta(S[i,t], K, Ttm, r, sig[t], option_type)
-                        Gamma = bs_gamma(S[i,t], K, Ttm, r, sig[t])
+                    V[:, t] = K * np.exp(-r * Ttm) * norm.cdf(-d2) - St * norm.cdf(-d1)
 
-                        a = 0.5 * Gamma * dS * dS
-                        bq = Delta * dS
-                        c = V[t] - target
+        # grid max & quick hits
+        max_vals = V.max(axis=1)
+        doubled = max_vals >= target
+        ttd = np.full(bs, np.nan)
+        if np.any(doubled):
+            # first grid time crossing
+            hit_mask = V[:, :-1] < target
+            nxt_mask = V[:, 1:] >= target
+            cross = hit_mask & nxt_mask
+            hit_idx = np.argmax(cross, axis=1)  # returns 0 if all False; guard below
+            has_hit = cross.any(axis=1)
+            ttd[has_hit] = time_grid[hit_idx[has_hit] + 1]
 
-                        alpha_hit = None
-                        eps = 1e-14
-                        if abs(a) < eps:
-                            # linear case
-                            if bq != 0.0:
-                                alpha = -c / bq
-                                if 0.0 < alpha < 1.0:
-                                    alpha_hit = alpha
-                        else:
-                            disc = bq*bq - 4*a*c
-                            if disc >= 0.0:
-                                sqrt_disc = np.sqrt(disc)
-                                for alpha in ((-bq - sqrt_disc)/(2*a), (-bq + sqrt_disc)/(2*a)):
-                                    if 0.0 < alpha < 1.0:
-                                        alpha_hit = float(alpha)
-                                        break
+        # ---- Γ-aware intrastep (only for those not yet marked doubled) ----
+        remaining = ~doubled
+        if np.any(remaining):
+            from .greeks import delta as bs_delta, gamma as bs_gamma
+            rem_idx = np.where(remaining)[0]
+            # iterate over time once; operate on all remaining paths at that t
+            for t in range(N):
+                if not rem_idx.size:
+                    break
+                St = S[rem_idx, t]
+                Stp1 = S[rem_idx, t + 1]
+                dS = Stp1 - St
+                Ttm = Ttm_grid[t]
+                if Ttm <= 0:
+                    continue
+                sigma = sig_t[t]
 
-                        if alpha_hit is not None:
-                            doubled[i] = True
-                            ttd[i] = time_grid[t] + alpha_hit*dt
-                            break
+                # Δ, Γ for all remaining paths at time t (vectorized)
+                sqrtT = np.sqrt(Ttm)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    d1 = (np.log(St / K) + (r + 0.5 * sigma**2) * Ttm) / (sigma * sqrtT)
+                from scipy.stats import norm
+                Delta = (norm.cdf(d1) if option_type == "call" else norm.cdf(d1) - 1.0)
+                # gamma formula vectorized
+                pdf_d1 = np.exp(-0.5 * d1**2) / np.sqrt(2 * np.pi)
+                Gamma = pdf_d1 / (St * sigma * sqrtT)
 
-            all_max.append(max_vals)
-            all_doubled.append(doubled)
-            all_ttd.append(ttd)
+                Vt = V[rem_idx, t]
+                a = 0.5 * Gamma * dS * dS
+                bq = Delta * dS
+                c = Vt - target
 
-        # aggregate
-        all_max = np.concatenate(all_max)
-        all_doubled = np.concatenate(all_doubled)
-        all_ttd = np.concatenate(all_ttd)
+                eps = 1e-14
+                alpha_hit = np.full(rem_idx.size, np.nan)
 
-        paths_doubled = int(np.sum(all_doubled))
-        total = int(len(all_doubled))
-        p = paths_doubled / total if total>0 else 0.0
+                # quadratic case where |a| >= eps
+                quad = np.abs(a) >= eps
+                if np.any(quad):
+                    disc = bq[quad] * bq[quad] - 4 * a[quad] * c[quad]
+                    pos = disc >= 0
+                    if np.any(pos):
+                        sd = np.sqrt(disc[pos])
+                        a2 = 2 * a[quad][pos]
+                        roots = np.vstack(((-bq[quad][pos] - sd) / a2,
+                                           (-bq[quad][pos] + sd) / a2)).T
+                        # pick the first root in (0,1)
+                        r = np.where((roots > 0) & (roots < 1), roots, np.nan)
+                        alpha_sel = np.nanmin(r, axis=1)  # min ignores NaN if one valid
+                        alpha_hit[np.where(quad)[0][np.where(pos)[0]]] = alpha_sel
 
-        valid_t = all_ttd[~np.isnan(all_ttd)]
-        avg_t = float(np.mean(valid_t)) if valid_t.size>0 else None
+                # linear case where |a| < eps
+                lin = ~quad
+                if np.any(lin):
+                    nz = bq[lin] != 0
+                    if np.any(nz):
+                        alpha = -c[lin][nz] / bq[lin][nz]
+                        good = (alpha > 0) & (alpha < 1)
+                        if np.any(good):
+                            idx_lin = np.where(lin)[0][np.where(nz)[0][np.where(good)[0]]]
+                            alpha_hit[idx_lin] = alpha[good]
 
-        out = MCResult(
-            probability_double=p,
-            expected_max_value=float(np.mean(all_max)),
-            p5_max_value=float(np.percentile(all_max, 5)),
-            p95_max_value=float(np.percentile(all_max, 95)),
-            avg_time_to_double_years=avg_t,
-            paths_doubled=paths_doubled,
-            total_paths=total,
-            seconds=time.time()-t0
-        )
-        return {
-            "probability_double": out.probability_double,
-            "expected_max_value": out.expected_max_value,
-            "p5_max_value": out.p5_max_value,
-            "p95_max_value": out.p95_max_value,
-            "avg_time_to_double_years": out.avg_time_to_double_years,
-            "paths_doubled": out.paths_doubled,
-            "total_paths": out.total_paths,
-            "seconds": out.seconds
-        }
+                got = ~np.isnan(alpha_hit)
+                if np.any(got):
+                    # mark these as doubled and assign ttd
+                    sel = rem_idx[got]
+                    doubled[sel] = True
+                    ttd[sel] = time_grid[t] + alpha_hit[got] * dt
+                    # update remaining set
+                    rem_idx = rem_idx[~got]
+
+        all_max.append(max_vals)
+        all_doubled.append(doubled)
+        all_ttd.append(ttd)
+
+    # aggregate
+    all_max = np.concatenate(all_max)
+    all_doubled = np.concatenate(all_doubled)
+    all_ttd = np.concatenate(all_ttd)
+
+    paths_doubled = int(np.sum(all_doubled))
+    total = int(len(all_doubled))
+    p = paths_doubled / total if total > 0 else 0.0
+    valid_t = all_ttd[~np.isnan(all_ttd)]
+    avg_t = float(np.mean(valid_t)) if valid_t.size > 0 else None
+
+    return {
+        "probability_double": p,
+        "expected_max_value": float(np.mean(all_max)),
+        "p5_max_value": float(np.percentile(all_max, 5)),
+        "p95_max_value": float(np.percentile(all_max, 95)),
+        "avg_time_to_double_years": avg_t,
+        "paths_doubled": paths_doubled,
+        "total_paths": total,
+        "seconds": time.time() - t0
+    }
