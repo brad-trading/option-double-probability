@@ -90,8 +90,8 @@ def main(symbol, expiry, option_type, strike, target_delta, sims, steps_per_day,
             price_source = "BS(surface IV)"
 
         if current_option_price <= 1e-6:
-            console.print("[yellow]Warning:[/] option price effectively 0; using theoretical may still be too small. "
-                          "Consider ATM or a delta-selected strike. Source =", price_source)
+            console.print(f"[yellow]Warning:[/] option price effectively 0; source={price_source}. "
+                          "Consider ATM or a delta-selected strike.")
 
     else:
         # Offline mode: mock everything
@@ -99,7 +99,9 @@ def main(symbol, expiry, option_type, strike, target_delta, sims, steps_per_day,
         if strike is None:
             strike = spot  # ATM for offline default
         vol_surface = VolatilitySurface(build_mock_surface(spot))
-        current_option_price = bs_price(spot, strike, T, cfg.risk_free, vol_surface.get_vol(strike, T), option_type)
+        iv_off = vol_surface.get_vol(strike, T)
+        current_option_price = bs_price(spot, strike, T, cfg.risk_free, iv_off, option_type)
+        price_source = "BS(mock surface IV)"
 
     # Run Monte Carlo
     engine = MonteCarlo(num_paths=sims, steps_per_day=steps_per_day, seed=seed)
@@ -115,6 +117,7 @@ def main(symbol, expiry, option_type, strike, target_delta, sims, steps_per_day,
         "expiry_years": float(T),
         "option_type": option_type,
         "current_option_price": float(current_option_price),
+        "price_source": price_source,
         "num_paths": res["total_paths"],
         "doubling_probability": res["probability_double"],
         "wilson_ci_95": wilson_ci(res["probability_double"], res["total_paths"]),
@@ -144,6 +147,7 @@ def main(symbol, expiry, option_type, strike, target_delta, sims, steps_per_day,
     table.add_row("Expected max value", _fmt_small(out["expected_max_value"]))
     table.add_row("5th–95th pct max value", f"{_fmt_small(out['p5_max_value'])} – {_fmt_small(out['p95_max_value'])}")
     table.add_row("Spot / Strike / Price", f"{out['spot']:.2f} / {out['strike']:.2f} / {_fmt_small(out['current_option_price'])}")
+    table.add_row("Price source", out["price_source"])
     table.add_row("Steps × Paths", f"{engine.N} × {out['num_paths']:,}")
     table.add_row("Runtime", f"{out['seconds']:.2f} s")
 
@@ -151,3 +155,4 @@ def main(symbol, expiry, option_type, strike, target_delta, sims, steps_per_day,
 
 if __name__ == "__main__":
     sys.exit(main())
+
