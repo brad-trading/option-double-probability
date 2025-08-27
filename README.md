@@ -20,10 +20,10 @@ Monte Carlo engine with **Gamma-aware intrastep detection** to estimate the prob
 git clone <your-repo-url> option-doubling
 cd option-doubling
 python -m venv .venv && source .venv/bin/activate  # (Windows: .venv\Scripts\activate)
-pip install -r requirements.txt
+pip install -r requirements.txt```
 
 # Example: 25k sims, 30-minute steps, mock data
-python cli.py --symbol AAPL --expiry 2025-12-19 --option-type call --strike 200 --sims 25000
+```python cli.py --symbol AAPL --expiry 2025-12-19 --option-type call --strike 200 --sims 25000```
 
 You’ll see a table with:
 
@@ -43,7 +43,7 @@ Ensure IB Client Portal Gateway is running and you’re authenticated.
 
 Then:
 
-python cli.py --symbol AAPL --expiry 2025-12-19 --option-type call --delta 0.25 --live
+```python cli.py --symbol AAPL --expiry 2025-12-19 --option-type call --delta 0.25 --live```
 
 
 The system will:
@@ -57,7 +57,7 @@ Run the simulation with market vols.
 If IB is unreachable, it falls back to offline mode.
 
 API server (optional)
-uvicorn api.main:app --host 0.0.0.0 --port 8000
+```uvicorn api.main:app --host 0.0.0.0 --port 8000```
 # Swagger UI at http://localhost:8000/docs
 
 Notes on accuracy
