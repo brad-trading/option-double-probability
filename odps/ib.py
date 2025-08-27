@@ -123,7 +123,6 @@ class IBClient:
         if not self.base_url:
             raise RuntimeError("IB base_url not set. Define IB_GATEWAY_URL or pass to IBClient().")
         verify = self.ca_bundle if self.ca_bundle else self.verify_ssl  # bool or path
-        # trust_env=False so OS/http_proxy env vars don't interfere with localhost
         return httpx.Client(base_url=self.base_url, timeout=10.0, verify=verify, trust_env=False)
 
     def _get(self, path: str, params: Dict | None = None):
@@ -140,6 +139,22 @@ class IBClient:
                 f"Ensure it is running/authenticated and SSL settings are correct. Underlying: {e}"
             ) from e
 
+    def _post(self, path: str, json: Dict | None = None):
+        try:
+            with self._client() as c:
+                r = c.post(path, json=json or {})
+                r.raise_for_status()
+                if r.text and r.headers.get("content-type","").startswith("application/json"):
+                    return r.json()
+                return {}
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(f"IB POST {path} returned {e.response.status_code}: {e.response.text}") from e
+        except Exception as e:
+            raise RuntimeError(
+                f"IB Gateway unreachable at {self.base_url}. "
+                f"Ensure it is running/authenticated and SSL settings are correct. Underlying: {e}"
+            ) from e
+
     # ------------- diagnostics -------------
 
     def auth_status(self) -> Dict:
@@ -148,9 +163,23 @@ class IBClient:
     # ------------- low-level market data -------------
 
     def _snapshot(self, conids: List[int | str], fields: List[str]) -> List[Dict]:
+        """
+        Get snapshot for conids. If we hit 403 (no entitlements), auto-enable delayed data and retry once.
+        """
         params = {"conids": ",".join(str(c) for c in conids), "fields": ",".join(fields)}
-        js = self._get("/iserver/marketdata/snapshot", params)
-        return js if isinstance(js, list) else [js]
+        try:
+            js = self._get("/iserver/marketdata/snapshot", params)
+            return js if isinstance(js, list) else [js]
+        except RuntimeError as e:
+            # Auto-enable delayed market data once, then retry
+            if " 403" in str(e) or "Forbidden" in str(e):
+                try:
+                    self._post("/iserver/marketdata/delayed/enable", {})
+                    js = self._get("/iserver/marketdata/snapshot", params)
+                    return js if isinstance(js, list) else [js]
+                except Exception:
+                    raise
+            raise
 
     def _spot_from_snapshot(self, conid: int | str) -> Optional[float]:
         """Request last + bid/ask; fall back to mid if last is missing."""
@@ -175,15 +204,31 @@ class IBClient:
         Resolve underlying conid robustly and return {'conid': int, 'price': float|None}.
         Strategy:
           1) Search candidates with /iserver/secdef/search.
-          2) Prefer exact symbol, US listings (NYSE/NASDAQ), SMART routes.
-          3) Probe top candidates with a snapshot (31/84/86) and pick the first with a usable spot (last or mid).
-          4) If none yield quotes, return the best-scored candidate with price=None.
+          2) Drop obvious bads (conid=2147483647, missing secType).
+          3) Prefer exact symbol, US listings (NYSE/NASDAQ), SMART routes.
+          4) Probe top candidates with snapshot (31/84/86); pick first with usable spot (last or mid).
+          5) If none yield quotes, return best-scored candidate with price=None.
         """
         data = self._get("/iserver/secdef/search", {"symbol": symbol})
         if not data or not isinstance(data, list):
             raise RuntimeError(f"No contracts found for symbol '{symbol}'.")
 
         symu = symbol.upper()
+
+        # filter out sentinel/bad entries
+        def good(x):
+            conid = (x.get("conid") or x.get("conId") or x.get("contractId"))
+            if not conid:
+                return False
+            try:
+                if int(conid) == 2147483647:  # IB sentinel; not a real contract
+                    return False
+            except Exception:
+                pass
+            sec = str(x.get("secType") or "").upper()
+            return (sec in ("", "STK"))  # IB often omits secType in this endpoint
+
+        filtered = [x for x in data if good(x)] or data
 
         def score(x):
             sx = (str(x.get("symbol") or "")).upper()
@@ -195,7 +240,7 @@ class IBClient:
             is_smart= 0 if exch == "SMART" else 1
             return (is_exact, is_us, is_smart)
 
-        candidates = sorted(data, key=score)
+        candidates = sorted(filtered, key=score)
 
         fields = [_FIELD_MAP["last"], _FIELD_MAP["bid"], _FIELD_MAP["ask"]]
         for x in candidates[:5]:
@@ -454,3 +499,4 @@ def find_strike_by_delta(
         expiry_years=expiry_years,
         exchange=exchange,
     )
+
