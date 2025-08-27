@@ -77,17 +77,21 @@ def main(symbol, expiry, option_type, strike, target_delta, sims, steps_per_day,
 
         if last is not None:
             current_option_price = float(last)
+            price_source = "last"
         elif bid is not None and ask is not None:
             current_option_price = float((bid + ask) / 2.0)
+            price_source = "mid(bid/ask)"
         elif iv_live is not None and iv_live > 0:
             current_option_price = bs_price(float(spot), float(strike), T, cfg.risk_free, float(iv_live), option_type)
+            price_source = "BS(live IV)"
         else:
             iv_surf = float(vol_surface.get_vol(float(strike), T))
             current_option_price = bs_price(float(spot), float(strike), T, cfg.risk_free, iv_surf, option_type)
+            price_source = "BS(surface IV)"
 
         if current_option_price <= 1e-6:
             console.print("[yellow]Warning:[/] option price effectively 0; using theoretical may still be too small. "
-                          "Consider ATM or a delta-selected strike.")
+                          "Consider ATM or a delta-selected strike. Source =", price_source)
 
     else:
         # Offline mode: mock everything
